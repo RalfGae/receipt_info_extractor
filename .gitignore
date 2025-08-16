@@ -4,3 +4,4 @@
 .env
 /__pycache__/
 /output
+/mcp_ikea_receipt_schema/__pycache__/

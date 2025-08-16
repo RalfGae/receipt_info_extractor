@@ -1,3 +1,35 @@
+import requests
+import pandas as pd
+from fuzzywuzzy import process
+# --- IKEA Product Sheet Integration ---
+def load_ikea_products(csv_path='products/ikea_products.csv'):
+    """
+    Loads IKEA product data from a CSV and returns a lookup dict and list of product names.
+    Assumes columns: 'name', 'category'.
+    """
+    try:
+        df = pd.read_csv(csv_path)
+        product_dict = {str(row['name']).strip().lower(): str(row['category']).strip() for _, row in df.iterrows()}
+        return product_dict, list(product_dict.keys())
+    except Exception as e:
+        print(f"[WARN] Could not load IKEA product sheet: {e}")
+        return {{}}, []
+
+def get_ikea_category(item_name, product_dict, product_names, threshold=95):
+    """
+    Fuzzy-matches item_name to IKEA product names and returns the category if found.
+    """
+    if not item_name:
+        return None
+    match = process.extractOne(item_name.lower(), product_names)
+    if match and match[1] >= threshold:
+        matched_name = match[0]
+        matched_score = match[1]
+        matched_category = product_dict[matched_name]
+        print(f"[DEBUG] IKEA match: input='{item_name}' matched='{matched_name}' (score={matched_score}), category='{matched_category}'")
+        return matched_category
+    print(f"[DEBUG] IKEA match: input='{item_name}' no good match found (best score={match[1] if match else 'N/A'})")
+    return None
 import sys
 from datetime import datetime
 import argparse
@@ -58,6 +90,39 @@ credentials = service_account.Credentials.from_service_account_file(
 drive_service = build('drive', 'v3', credentials=credentials)
 
 def feed_image_to_llm_local(image_path, client):
+    # Load IKEA product data once (could be moved to global scope for efficiency)
+    ikea_product_dict, ikea_product_names = load_ikea_products()
+
+    def mcp_lookup_ikea_category(item_name, threshold=95):
+        """
+        Try the full item name and all substrings (split by space and hyphen) for MCP lookup.
+        Return the best category found (highest score above threshold).
+        """
+        url = "http://localhost:8000/lookup"
+        candidates = set()
+        if not item_name:
+            return None
+        # Add full name, then all space- and hyphen-separated substrings
+        candidates.add(item_name.strip())
+        for part in item_name.replace('-', ' ').split():
+            if part.strip():
+                candidates.add(part.strip())
+        best = {"score": -1, "category": None, "matched_name": None, "input": None}
+        for candidate in candidates:
+            params = {"item_name": candidate, "threshold": threshold}
+            try:
+                resp = requests.get(url, params=params, timeout=2)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data.get("found") and data.get("score", 0) > best["score"]:
+                        best = {"score": data["score"], "category": data["category"], "matched_name": data["matched_name"], "input": candidate}
+            except Exception as e:
+                print(f"[WARN] MCP lookup failed for '{candidate}': {e}")
+        if best["category"]:
+            print(f"[DEBUG] MCP best match: input='{item_name}' tried='{best['input']}' matched='{best['matched_name']}', category='{best['category']}', score={best['score']}")
+            return best["category"]
+        print(f"[DEBUG] MCP no good match for '{item_name}' (tried substrings: {candidates})")
+        return None
     """
     Encodes a local image and sends it to the OpenAI LLM for receipt information extraction.
     Prints the extracted JSON and token usage if available.
@@ -84,7 +149,11 @@ def feed_image_to_llm_local(image_path, client):
         "The date may appear in formats like DD.MM.YYYY, MM/DD/YYYY, or YYYY-MM-DD. "
         "If multiple dates are present, choose the one most likely to be the purchase date. "
         "Return the result as JSON according to the provided schema. "
-        "If the date is missing or ambiguous, return null for the date field."
+        "If the date is missing or ambiguous, return null for the date field. "
+        "Always use singular English nouns for categories (e.g., 'Fruit', 'Snack', 'Bag'). "
+        "Normalize the store name to its most common, simple form (e.g., 'IKEA', 'REWE', 'ESSO'). "
+        "Assign the most specific category possible; use 'General' only if no other category fits. "
+        "If the store is known for a specific product type, prefer relevant categories (e.g., 'Furniture' for IKEA, 'Food' for REWE)."
     )
 
     # Step 4: Enhance image and extract OCR text
@@ -131,6 +200,7 @@ def feed_image_to_llm_local(image_path, client):
     import json
     try:
         result = json.loads(response.output_text)
+        # --- Post-process date ---
         date_str = result.get("date")
         if not date_str or not is_valid_date(date_str):
             # Try to extract date from OCR text
@@ -139,10 +209,68 @@ def feed_image_to_llm_local(image_path, client):
                 result["date"] = extracted_date
             else:
                 result["date"] = None
+
+        # --- Post-process store name normalization ---
+        store_map = {
+            "ikea": "IKEA",
+            "ikea deutschland gmbh & co. kg": "IKEA",
+            "ikea deutschland gmbh&co kg/nl furth": "IKEA",
+            "rewe": "REWE",
+            "esso tankstelle": "ESSO",
+            # Add more mappings as needed
+        }
+        store = result.get("store", "")
+        store_key = store.lower().replace(",", "").replace("  ", " ").strip()
+        for k, v in store_map.items():
+            if k in store_key:
+                result["store"] = v
+                break
+
+        # --- Post-process categories: singularize and map known categories ---
+        def singularize(word):
+            if word.lower().endswith('ies'):
+                return word[:-3] + 'y'
+            elif word.lower().endswith('s') and not word.lower().endswith('ss'):
+                return word[:-1]
+            return word
+
+        category_map = {
+            "fruits": "Fruit",
+            "fruit": "Fruit",
+            "vegetables": "Vegetable",
+            "snacks": "Snack",
+            "food": "Food",
+            "furniture": "Furniture",
+            "plant": "Plant",
+            "bag": "Bag",
+            # Add more as needed
+        }
+        for item in result.get("items", []):
+            cat = item.get("category", "")
+            cat_key = cat.lower().strip()
+            # If store is IKEA, try MCP tool first, then fallback to local product sheet
+            if result.get("store", "").upper() == "IKEA":
+                mcp_cat = mcp_lookup_ikea_category(item.get("name", ""))
+                if mcp_cat:
+                    item["category"] = mcp_cat
+                    continue
+                # fallback to local fuzzy match if MCP fails
+                ikea_cat = get_ikea_category(item.get("name", ""), ikea_product_dict, ikea_product_names)
+                if ikea_cat:
+                    item["category"] = ikea_cat
+                    continue
+            if cat_key in category_map:
+                item["category"] = category_map[cat_key]
+            else:
+                item["category"] = singularize(cat)
+            # Optionally, assign 'General' if category is empty or unknown
+            if not item["category"]:
+                item["category"] = "General"
+
         print(json.dumps(result, indent=2, ensure_ascii=False))
     except Exception as e:
         print(response.output_text)
-        print(f"[Warning] Could not post-process date: {e}")
+        print(f"[Warning] Could not post-process date/store/category: {e}")
 
     # Print token usage if available
     if hasattr(response, "usage"):

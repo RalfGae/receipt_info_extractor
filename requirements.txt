@@ -1,8 +1,13 @@
-python-dotenv
+fastapi
+fuzzywuzzy
 google-api-python-client
 google-auth
 google-auth-oauthlib
 openai
-pydantic
+pandas
 pillow
+python-Levenshtein
+python-dotenv
+pydantic
 pytesseract
+uvicorn
